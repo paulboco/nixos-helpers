@@ -1411,31 +1411,68 @@ The only change to the draft is <code>baseGen = 11;</code>.</p>
 <p>Save it as <code>~/nixos/generation-policy.nix</code>:</p>
 <div class="highlight"><pre><span></span><code><span class="p">{</span> pkgs<span class="p">,</span> <span class="o">...</span> <span class="p">}:</span>
 
+<span class="c1"># Goal: the boot menu always shows exactly three entries:</span>
+<span class="c1">#   1. newest generation (current)</span>
+<span class="c1">#   2. the generation before it</span>
+<span class="c1">#   3. a fixed "base" generation that is never removed</span>
+<span class="c1">#</span>
+<span class="c1"># NixOS does not do this on its own: configurationLimit only trims boot menu</span>
+<span class="c1"># entries, and garbage collection only deletes store paths that no generation</span>
+<span class="c1"># or root references. So we prune generations ourselves, skipping the base.</span>
+
 <span class="k">let</span>
+    <span class="c1"># Generation number of the base install. Check with:</span>
+    <span class="c1">#   nix-env -p /nix/var/nix/profiles/system --list-generations</span>
     <span class="ss">baseGen</span> <span class="o">=</span> <span class="mi">11</span><span class="p">;</span>
+
+    <span class="c1"># How many of the newest generations to keep besides the base.</span>
     <span class="ss">keepNewest</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
 
+    <span class="c1"># Installs a `prune-generations` command (run it with sudo).</span>
+    <span class="c1"># It deletes every system generation except:</span>
+    <span class="c1">#   - the base generation (baseGen)</span>
+    <span class="c1">#   - the newest `keepNewest` generations by number</span>
+    <span class="c1"># Deleting a generation removes its link from the profile and the boot</span>
+    <span class="c1"># menu. Its store paths are freed at the next garbage collection.</span>
     <span class="ss">pruneGenerations</span> <span class="o">=</span> pkgs<span class="o">.</span>writeShellScriptBin <span class="s2">"prune-generations"</span> <span class="s s-Multiline">''</span>
 <span class="s s-Multiline">        set -euo pipefail</span>
+
+<span class="s s-Multiline">        # The system profile; every generation is a link inside it.</span>
 <span class="s s-Multiline">        profile=/nix/var/nix/profiles/system</span>
+
+<span class="s s-Multiline">        # List of generation numbers, oldest first.</span>
 <span class="s s-Multiline">        gens=$(</span><span class="si">${</span>pkgs<span class="o">.</span>nix<span class="si">}</span><span class="s s-Multiline">/bin/nix-env -p "$profile" --list-generations | </span><span class="si">${</span>pkgs<span class="o">.</span>gawk<span class="si">}</span><span class="s s-Multiline">/bin/awk '{print $1}')</span>
+
+<span class="s s-Multiline">        # The newest generations to keep (last N lines of the list).</span>
 <span class="s s-Multiline">        newest=$(echo "$gens" | </span><span class="si">${</span>pkgs<span class="o">.</span>coreutils<span class="si">}</span><span class="s s-Multiline">/bin/tail -n </span><span class="si">${</span><span class="nb">toString</span> keepNewest<span class="si">}</span><span class="s s-Multiline">)</span>
+
+<span class="s s-Multiline">        # Build the list of generations to delete: everything that is</span>
+<span class="s s-Multiline">        # neither the base nor one of the newest.</span>
 <span class="s s-Multiline">        delete=""</span>
 <span class="s s-Multiline">        for g in $gens; do</span>
 <span class="s s-Multiline">            [ "$g" = "</span><span class="si">${</span><span class="nb">toString</span> baseGen<span class="si">}</span><span class="s s-Multiline">" ] &amp;&amp; continue</span>
 <span class="s s-Multiline">            echo "$newest" | </span><span class="si">${</span>pkgs<span class="o">.</span>gnugrep<span class="si">}</span><span class="s s-Multiline">/bin/grep -qx "$g" &amp;&amp; continue</span>
 <span class="s s-Multiline">            delete="$delete $g"</span>
 <span class="s s-Multiline">        done</span>
+
+<span class="s s-Multiline">        # Delete them, if there is anything to delete.</span>
 <span class="s s-Multiline">        if [ -n "$delete" ]; then</span>
 <span class="s s-Multiline">            </span><span class="si">${</span>pkgs<span class="o">.</span>nix<span class="si">}</span><span class="s s-Multiline">/bin/nix-env -p "$profile" --delete-generations $delete</span>
 <span class="s s-Multiline">        fi</span>
 <span class="s s-Multiline">    ''</span><span class="p">;</span>
 <span class="k">in</span>
 <span class="p">{</span>
+    <span class="c1"># Make the prune-generations command available system-wide.</span>
     environment<span class="o">.</span><span class="ss">systemPackages</span> <span class="o">=</span> <span class="p">[</span> pruneGenerations <span class="p">];</span>
 
+    <span class="c1"># Show at most three entries in the systemd-boot menu: the base plus the</span>
+    <span class="c1"># two newest, once pruning has run. Right after a rebuild there are</span>
+    <span class="c1"># briefly four generations, and the base is hidden until you prune.</span>
     boot<span class="o">.</span>loader<span class="o">.</span>systemd-boot<span class="o">.</span><span class="ss">configurationLimit</span> <span class="o">=</span> <span class="mi">3</span><span class="p">;</span>
 
+    <span class="c1"># Weekly garbage collection of unreferenced store paths. The base and</span>
+    <span class="c1"># kept generations are referenced, so they are safe. This does not</span>
+    <span class="c1"># remove generations, so pruning is still done by prune-generations.</span>
     nix<span class="o">.</span><span class="ss">gc</span> <span class="o">=</span> <span class="p">{</span>
         <span class="ss">automatic</span> <span class="o">=</span> <span class="no">true</span><span class="p">;</span>
         <span class="ss">dates</span> <span class="o">=</span> <span class="s2">"weekly"</span><span class="p">;</span>
